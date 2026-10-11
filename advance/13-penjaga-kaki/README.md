@@ -71,3 +71,26 @@ Berhenti: `kill $(cat ~/.penjaga-kaki/penjaga.pid)`.
   restart), penjaga ikut mati. Kait di `mulai-server.sh` + start manual
   adalah jalur hidupnya kembali; penjaga adalah pengurang risiko, bukan
   jaminan 24/7.
+
+## Penjaga v2 — Sembuh Sendiri (V5, 11 Okt 2026)
+
+`penjaga-v2.py` menggantikan loop Bash di atas sebagai penjaga
+residen (Bash lama disimpan sebagai arsip dan tidak dijalankan
+bersamaan). Fokusnya sesuai `../DESAIN-V5-SEMBUH-SENDIRI.md`
+§3.1–3.2: **detektor kesehatan pohon 3-lapis** (soket 19102
+STATUS/PING + dumpsys accessibility via rish + wakefulness via
+rish — vonis SEHAT/BEKU/MATI tidak pernah dari satu lapis) dan
+**tangga pemulihan**: (1) GLOBAL HOME pelepas beku, (2) tulis
+ulang settings aksesibilitas + MainActivity, (3) force-stop →
+tangga 2 lagi / pasang ulang dari APK cadangan
+`~/muse-droid/cadangan/pendamping.apk`, (4) eskalasi berisi SATU
+tindakan manusia persis di `~/.penjaga-kaki/butuh-manusia.txt`.
+
+Mode bawaan **AMATI** (vonis dicatat, tangga tidak jalan);
+saklar ke **OTOMATIS** lewat `~/.penjaga-kaki/penjaga-v2.conf`
+(`mode=OTOMATIS`, dibaca ulang tiap siklus) atau env
+`PENJAGA_MODE`. Berkas keadaan: `~/.penjaga-kaki/{penjaga-v2.log,
+status-v2, penjaga-v2.pid}`. Gerbang luringnya:
+`uji-penjaga-v2-luring.py` (12 asersi: vonis SEHAT/diam-wajar/
+BEKU/MATI, AMATI tanpa tindakan, tangga 2–3 tercatat, eskalasi
+tertulis, pulih oleh tangga 1).
