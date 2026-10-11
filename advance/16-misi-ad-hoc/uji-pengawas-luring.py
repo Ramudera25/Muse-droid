@@ -12,6 +12,12 @@
 #   (c) misi v1 lama -> tuntas tanpa baris BUKTI (perilaku lama).
 #   (d) ANGGARAN langkah terlampaui -> berhenti + laporan keadaan.
 #   (d2) ANGGARAN waktu terlampaui -> berhenti + laporan keadaan.
+# Skenario V5 (gerbang prasyarat §3.3 + format v2 §3.4):
+#   (e) pohon diam -> ditolak gerbang; (f) baterai rendah -> ditolak;
+#   (g) penanda sesi asing segar -> ditolak; (g2) penanda sesi
+#   sendiri -> lolos; (h) kebijakan `| lanjut`; (i) kebijakan
+#   `| ke <label>`; (j) SYARAT baterai>= menimpa ambang bawaan;
+#   (k) SYARAT target-dingin menolak target yang sedang di depan.
 # Keluar 0 hanya bila semua asersi lulus.
 # Pakai: python3 uji-pengawas-luring.py
 
@@ -71,12 +77,17 @@ class Mesin:
     """Keadaan layar tiruan: paket + simpul per layar, versi pohon,
     isi kolom terakhir, dan catatan gestur yang diterima."""
 
-    def __init__(self, layar, awal):
+    def __init__(self, layar, awal, bergerak=True):
         self.layar = layar
         self.kini = awal
         self.versi = 1
         self.isi = ""
         self.gestur = []
+        # V5: gerbang prasyarat menuntut versi BERGERAK di antara dua
+        # PING berjarak. bergerak=True meniru perangkat hidup (tiap
+        # PING = peristiwa baru menaikkan versi); False = salinan
+        # beku untuk skenario penolakan gerbang.
+        self.bergerak = bergerak
 
     def _scr(self):
         return self.layar[self.kini]
@@ -84,6 +95,8 @@ class Mesin:
     def jawab(self, perintah):
         """-> (teks balasan, tutup koneksi sesudahnya?)"""
         if perintah == "PING":
+            if self.bergerak:
+                self.versi += 1
             return json.dumps({"pong": True, "versi": self.versi,
                                "umur_ms": 1}), False
         if perintah == "PAKET?":
@@ -191,7 +204,8 @@ verifikasi terakhir: {tgl}
 """
 
 
-def jalankan_skenario(job_teks, layar, awal, pakai_kartu=False):
+def jalankan_skenario(job_teks, layar, awal, pakai_kartu=False,
+                      bergerak=True, env_tambahan=None, sesi=None):
     tmp = tempfile.mkdtemp(prefix="pengawas-")
     bindir = os.path.join(tmp, "bin")
     os.makedirs(bindir)
@@ -204,6 +218,9 @@ def jalankan_skenario(job_teks, layar, awal, pakai_kartu=False):
           "exit 0\n", exe=True)
     home = os.path.join(tmp, "home")
     os.makedirs(home)
+    if sesi is not None:
+        os.makedirs(os.path.join(home, "muse-droid"))
+        tulis(os.path.join(home, "muse-droid", ".sesi-aktif"), sesi)
     kdir = os.path.join(tmp, "kartu")
     os.makedirs(kdir)
     if pakai_kartu:
@@ -211,7 +228,7 @@ def jalankan_skenario(job_teks, layar, awal, pakai_kartu=False):
               KARTU_CONTOH.format(tgl=datetime.date.today().isoformat()))
     job = os.path.join(tmp, "misi.job")
     tulis(job, job_teks)
-    mesin = Mesin(layar, awal)
+    mesin = Mesin(layar, awal, bergerak=bergerak)
     srv = Server(("127.0.0.1", 19102), Penangan)
     srv.mesin = mesin
     th = threading.Thread(target=srv.serve_forever, daemon=True)
@@ -220,11 +237,15 @@ def jalankan_skenario(job_teks, layar, awal, pakai_kartu=False):
     env["PATH"] = bindir + os.pathsep + env["PATH"]
     env["HOME"] = home
     env["MUSE_KARTU_DIR"] = kdir
+    # Gerbang V5 membaca baterai lewat kait uji agar deterministik.
+    env["MISI_BATERAI_UJI"] = "80"
+    if env_tambahan:
+        env.update(env_tambahan)
     try:
         p = subprocess.run([sys.executable, RUNNER, job],
                            capture_output=True, text=True, timeout=180,
                            env=env)
-        return p.returncode, p.stdout + p.stderr, mesin
+        return p.returncode, p.stdout + p.stderr, mesin, home
     finally:
         srv.shutdown()
         srv.server_close()
@@ -264,7 +285,7 @@ def main():
         'VERIFIKASI BACA_ADA "teks-dari-ocr"\n'
         'VERIFIKASI TEKS_ADA "tidak-akan-pernah-ada" LEMBUT\n'
     )
-    rc, out, mesin = jalankan_skenario(job_a, LAYAR_CONTOH, "beranda",
+    rc, out, mesin, home = jalankan_skenario(job_a, LAYAR_CONTOH, "beranda",
                                        pakai_kartu=True)
     tampilkan("SKENARIO (a) — misi v2 terverifikasi penuh", out)
     periksa("a", rc == 0, "a1: kode keluar 0 (misi tuntas)")
@@ -288,7 +309,7 @@ def main():
         'VERIFIKASI TEKS_ADA "jangkar-yang-salah-total"\n'
         'KETUK_TEKS "Galeri"\n'
     )
-    rc, out, mesin = jalankan_skenario(job_b, LAYAR_CONTOH, "beranda",
+    rc, out, mesin, home = jalankan_skenario(job_b, LAYAR_CONTOH, "beranda",
                                        pakai_kartu=True)
     tampilkan("SKENARIO (b) — uji negatif jangkar salah", out)
     periksa("b", rc == 1, "b1: kode keluar 1")
@@ -307,14 +328,19 @@ def main():
         'KETUK_TEKS "Lanjut"\n'
         'CEK_TEKS "Selesai"\n'
     )
-    rc, out, mesin = jalankan_skenario(job_c, LAYAR_LAMA, "lama")
+    rc, out, mesin, home = jalankan_skenario(job_c, LAYAR_LAMA, "lama")
     tampilkan("SKENARIO (c) — regresi format v1", out)
     periksa("c", rc == 0, "c1: kode keluar 0")
     periksa("c", "BERES" in out, "c2: baris BERES tercetak")
     periksa("c", "BUKTI" not in out and "VERIFIKASI" not in out,
             "c3: tanpa baris BUKTI/VERIFIKASI (perilaku v1 utuh)")
-    periksa("c", "kartu" not in out,
-            "c4: tanpa kartu, tanpa jejak v2 di log")
+    # Catatan V5: gerbang prasyarat memang berjalan untuk SEMUA misi
+    # (desain §3.3) dan baris GERBANG target menyebut status kartu —
+    # jadi proksi "kata 'kartu' absen" tidak lagi tepat. Properti v1
+    # yang sebenarnya dijaga: kartu TIDAK dimuat/dipakai dan tidak
+    # ada mesin kebijakan v2 yang terlibat.
+    periksa("c", "dimuat" not in out and "kebijakan" not in out,
+            "c4: kartu tidak dimuat, mesin kebijakan v2 tidak terlibat")
 
     # ---- (d) anggaran langkah terlampaui --------------------------------
     job_d = (
@@ -324,7 +350,7 @@ def main():
         'KETUK_TEKS "Masuk"\n'
         'KETUK_TEKS "Galeri"\n'
     )
-    rc, out, mesin = jalankan_skenario(job_d, LAYAR_CONTOH, "beranda",
+    rc, out, mesin, home = jalankan_skenario(job_d, LAYAR_CONTOH, "beranda",
                                        pakai_kartu=True)
     tampilkan("SKENARIO (d) — anggaran langkah terlampaui", out)
     periksa("d", rc == 1, "d1: kode keluar 1")
@@ -341,7 +367,7 @@ def main():
         "JEDA 2\n"
         'KETUK_TEKS "Masuk"\n'
     )
-    rc, out, mesin = jalankan_skenario(job_d2, LAYAR_CONTOH, "beranda",
+    rc, out, mesin, home = jalankan_skenario(job_d2, LAYAR_CONTOH, "beranda",
                                        pakai_kartu=True)
     tampilkan("SKENARIO (d2) — anggaran waktu terlampaui", out)
     periksa("d2", rc == 1, "d2.1: kode keluar 1")
@@ -349,6 +375,128 @@ def main():
             "d2.2: berhenti karena durasi + laporan keadaan")
     periksa("d2", jumlah_ketuk(mesin) == 0,
             "d2.3: langkah sesudah JEDA tidak dijalankan")
+
+    # ---- (e) gerbang: pohon diam -> misi ditolak -------------------------
+    import glob as globmod
+    job_e = (
+        "TARGET com.contoh\n"
+        "BUKA_APLIKASI com.contoh\n"
+        'KETUK_TEKS "Masuk"\n'
+    )
+    rc, out, mesin, home = jalankan_skenario(
+        job_e, LAYAR_CONTOH, "beranda", pakai_kartu=True, bergerak=False)
+    tampilkan("SKENARIO (e) — gerbang menolak pohon diam", out)
+    periksa("e", rc == 1, "e1: kode keluar 1 (ditolak gerbang)")
+    periksa("e", "GERBANG" in out and "TIDAK bergerak" in out,
+            "e2: alasan gerbang tertulis (versi tidak bergerak)")
+    periksa("e", jumlah_ketuk(mesin) == 0 and "BERES" not in out,
+            "e3: langkah pertama TIDAK jalan")
+    berkas_hasil = globmod.glob(os.path.join(
+        home, "muse-droid", "log", "*.hasil"))
+    isi_hasil = ""
+    if berkas_hasil:
+        isi_hasil = open(berkas_hasil[0], encoding="utf-8").read()
+    periksa("e", "GERBANG" in isi_hasil,
+            "e4: alasan gerbang juga tertulis di berkas .hasil")
+
+    # ---- (f) gerbang: baterai rendah -> ditolak --------------------------
+    rc, out, mesin, home = jalankan_skenario(
+        job_e, LAYAR_CONTOH, "beranda", pakai_kartu=True,
+        env_tambahan={"MISI_BATERAI_UJI": "15"})
+    tampilkan("SKENARIO (f) — gerbang menolak baterai rendah", out)
+    periksa("f", rc == 1, "f1: kode keluar 1")
+    periksa("f", "baterai 15%" in out and "ambang 30" in out,
+            "f2: alasan baterai tertulis (15% < ambang bawaan 30)")
+    periksa("f", jumlah_ketuk(mesin) == 0,
+            "f3: langkah pertama TIDAK jalan")
+
+    # ---- (g) gerbang: penanda sesi asing segar -> ditolak ----------------
+    rc, out, mesin, home = jalankan_skenario(
+        job_e, LAYAR_CONTOH, "beranda", pakai_kartu=True,
+        sesi="operator-lain|2099-01-01")
+    tampilkan("SKENARIO (g) — gerbang menolak sesi asing segar", out)
+    periksa("g", rc == 1, "g1: kode keluar 1")
+    periksa("g", "sesi asing" in out and "operator-lain" in out,
+            "g2: alasan sesi asing tertulis dengan pemiliknya")
+    periksa("g", jumlah_ketuk(mesin) == 0,
+            "g3: langkah pertama TIDAK jalan")
+
+    # ---- (g2) penanda sesi milik sendiri -> lolos -------------------------
+    rc, out, mesin, home = jalankan_skenario(
+        job_e, LAYAR_CONTOH, "beranda", pakai_kartu=True,
+        sesi="operator-lain|2099-01-01",
+        env_tambahan={"MISI_SESI_SAYA": "operator-lain"})
+    tampilkan("SKENARIO (g2) — penanda sesi sendiri lolos gerbang", out)
+    periksa("g2", rc == 0 and "BERES" in out,
+            "g2.1: misi tuntas (penanda diakui milik sesi ini)")
+    periksa("g2", "milik sesi ini" in out,
+            "g2.2: pengakuan sesi tertulis di baris GERBANG")
+
+    # ---- (h) format v2: kebijakan LANJUT ---------------------------------
+    job_h = (
+        "TARGET com.contoh\n"
+        "BUKA_APLIKASI com.contoh\n"
+        'KETUK_TEKS "TidakAdaSamaSekali" | lanjut\n'
+        'KETUK_TEKS "Masuk"\n'
+        'CEK_TEKS "Selamat datang"\n'
+    )
+    rc, out, mesin, home = jalankan_skenario(job_h, LAYAR_CONTOH,
+                                             "beranda", pakai_kartu=True)
+    tampilkan("SKENARIO (h) — kebijakan gagal: lanjut", out)
+    periksa("h", rc == 0 and "BERES" in out,
+            "h1: misi tuntas meski langkah 2 gagal (kebijakan lanjut)")
+    periksa("h", "kebijakan LANJUT" in out,
+            "h2: penerapan kebijakan lanjut tercatat")
+    periksa("h", jumlah_ketuk(mesin) == 1,
+            "h3: langkah sesudah kegagalan tetap jalan (KETUK Masuk)")
+
+    # ---- (i) format v2: kebijakan KE <label> ------------------------------
+    job_i = (
+        "TARGET com.contoh\n"
+        "BUKA_APLIKASI com.contoh\n"
+        'KETUK_TEKS "TidakAdaSamaSekali" | ke pulih\n'
+        'KETUK_TEKS "Masuk"\n'
+        "LABEL pulih\n"
+        'CEK_TEKS "Beranda Contoh"\n'
+    )
+    rc, out, mesin, home = jalankan_skenario(job_i, LAYAR_CONTOH,
+                                             "beranda", pakai_kartu=True)
+    tampilkan("SKENARIO (i) — kebijakan gagal: ke label", out)
+    periksa("i", rc == 0 and "BERES" in out,
+            "i1: misi tuntas lewat lompatan label")
+    periksa("i", "kebijakan KE pulih" in out,
+            "i2: lompatan ke label 'pulih' tercatat")
+    periksa("i", jumlah_ketuk(mesin) == 0,
+            "i3: langkah di antara (KETUK Masuk) DILEWATI lompatan")
+
+    # ---- (j) SYARAT baterai>= menimpa ambang bawaan -----------------------
+    job_j = (
+        "TARGET com.contoh\n"
+        "SYARAT baterai>=50\n"
+        "BUKA_APLIKASI com.contoh\n"
+    )
+    rc, out, mesin, home = jalankan_skenario(
+        job_j, LAYAR_CONTOH, "beranda", pakai_kartu=True,
+        env_tambahan={"MISI_BATERAI_UJI": "30"})
+    tampilkan("SKENARIO (j) — SYARAT baterai>=50 menolak 30%", out)
+    periksa("j", rc == 1, "j1: kode keluar 1")
+    periksa("j", "ambang 50" in out,
+            "j2: ambang SYARAT (50) yang dipakai, bukan bawaan (30)")
+
+    # ---- (k) SYARAT target-dingin: target sedang di depan -----------------
+    job_k = (
+        "TARGET com.contoh\n"
+        "SYARAT target-dingin\n"
+        "BUKA_APLIKASI com.contoh\n"
+    )
+    rc, out, mesin, home = jalankan_skenario(job_k, LAYAR_CONTOH,
+                                             "beranda", pakai_kartu=True)
+    tampilkan("SKENARIO (k) — SYARAT target-dingin menolak", out)
+    periksa("k", rc == 1, "k1: kode keluar 1")
+    periksa("k", "target-dingin" in out,
+            "k2: alasan target-dingin tertulis")
+    periksa("k", jumlah_ketuk(mesin) == 0 and "BERES" not in out,
+            "k3: misi tidak jalan sama sekali")
 
     print("=" * 72)
     gagal = [n for n, ok in HASIL if not ok]
