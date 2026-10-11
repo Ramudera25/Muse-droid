@@ -6,6 +6,16 @@
 //
 // Protokol (satu baris UTF-8 per koneksi, balasan satu baris JSON):
 //   PING          -> {"pong":true,"versi":N,"umur_ms":N}
+//   STATUS        -> {"ok":true,"versi":N,"umur_ms":N,"stempel_ms":N,
+//                     "sekarang_uptime_ms":N,"terikat":bool,"paket":"...",
+//                     "jumlah_simpul":N,"oto_sukses":N,"oto_gagal":N,
+//                     "bingkai_versi":N,"umur_bingkai_ms":N,
+//                     "kode_versi":N,"nama_versi":"..."}
+//                     (V5 "Sembuh Sendiri": bahan baku detektor kesehatan —
+//                     versi salinan, waktu kejadian terakhir (uptime),
+//                     umur salinan, status ikatan layanan, dan penghitung
+//                     tangkap otomatis; satu jawaban ringkas agar penjaga
+//                     tidak perlu menebak dari banyak perintah)
 //   PAKET?        -> {"paket":"nama.paket","umur_ms":N}
 //   TEKS? <teks>  -> {"ada":bool,"umur_ms":N,"versi":N}
 //   CARI <teks>   -> {"ada":true,"x":N,"y":N,"bounds":"[x1,y1][x2,y2]",
@@ -21,6 +31,25 @@
 //                     balasan menunggu versi salinan NAIK (verifikasi
 //                     bawaan, batas 1,2 dtk) sebelum dikirim)
 //   GLOBAL BACK|HOME|RECENTS -> sama (performGlobalAction)
+//   BINGKAI       -> baris JSON {"ok":bool,"sumber":"segar|buffer|buffer-throttle",
+//                     "versi_bingkai":N,"umur_bingkai_ms":N,"byte":N} DIIKUTI
+//                     N byte PNG mentah pada koneksi yang sama (V4.3 "Mata":
+//                     takeScreenshot layanan, API 30+; throttle +-1,1 dtk —
+//                     panggilan terlalu rapat dilayani dari buffer)
+//   AMBIL         -> sama, tapi selalu dari buffer tangkapan terakhir
+//                     (buffer terisi oleh BINGKAI atau tangkap otomatis
+//                     saat paket depan berganti aplikasi)
+//   BACA [ambang] [STATUSBAR]
+//                  -> header JSON {"ok":bool,"versi_bingkai":N,
+//                     "latensi_ms":N,"jumlah_baris":N} DIIKUTI baris-baris
+//                     "teks<TAB>x1,y1,x2,y2<TAB>skor" sampai koneksi
+//                     ditutup (V4.4 "Mata Baca": OCR di perangkat atas
+//                     bingkai segar, model PP-OCRv5 via ONNX Runtime —
+//                     lihat OcrBaca.kt; penasihat saja, pohon tetap
+//                     hakim. Penyaring positif-palsu v1: baris simbol
+//                     <=2 karakter dibuang; pita status bar diabaikan
+//                     kecuali token STATUSBAR diberikan; gerbang
+//                     baterai <30% tanpa cas menolak OCR jalan)
 //   TOMBOL <kode>  -> {"ok":bool,"kode":N,"versi_sblm":N,"versi_ssdh":N,
 //                     "naik":bool,"latensi_ms":N[, "sebab":"..."]}
 //                     V4.2: 224 (WAKEUP) via wakelock ACQUIRE_CAUSES_WAKEUP
@@ -39,6 +68,10 @@ import android.accessibilityservice.AccessibilityServiceInfo
 import android.accessibilityservice.GestureDescription
 import android.graphics.Path
 import android.graphics.Rect
+import android.graphics.Bitmap
+import android.os.Build
+import android.view.Display
+import java.io.ByteArrayOutputStream
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -74,6 +107,15 @@ object PohonUI {
 
     fun umurMs(): Long =
         if (stempelMs == 0L) -1 else SystemClock.uptimeMillis() - stempelMs
+    // V4.3 "Mata": bingkai PNG terakhir + versi pohon & waktu tangkapnya.
+    @Volatile var bingkaiPng: ByteArray? = null
+    @Volatile var bingkaiVersi: Long = -1
+    @Volatile var bingkaiStempelMs: Long = 0
+    @Volatile var tangkapTerakhirMs: Long = 0
+    // V4.3.1: hasil tangkap otomatis terakhir — teramati dari header AMBIL.
+    @Volatile var otoSukses: Int = 0
+    @Volatile var otoGagal: Int = 0
+    @Volatile var otoGalat: String = ""
 }
 
 class LayananAkses : AccessibilityService() {
@@ -163,10 +205,21 @@ class LayananAkses : AccessibilityService() {
                 // Node berubah di tengah jalan — lewati, salinan berikutnya menutupinya.
             }
         }
+        val paketBaru = akar.packageName?.toString() ?: ""
+        val paketLama = PohonUI.paketDepan
         PohonUI.simpul = hasil
-        PohonUI.paketDepan = akar.packageName?.toString() ?: ""
+        PohonUI.paketDepan = paketBaru
         PohonUI.stempelMs = SystemClock.uptimeMillis()
         PohonUI.versi++
+        // V4.3: tangkap terpicu kejadian — jendela berpindah aplikasi =
+        // lompatan besar; ambil satu bingkai tertunda 400 ms (layar sempat
+        // stabil) di utas latar (bingkai() menunggu gerbang; jangan di utas
+        // utama yang juga mengantar callback tangkapan).
+        if (paketLama.isNotEmpty() && paketBaru.isNotEmpty() && paketBaru != paketLama) {
+            penangan.postDelayed({
+                thread { try { tangkapOtomatis() } catch (e: Exception) { } }
+            }, 400)
+        }
     }
 
     // ---- aksi set-text pada node HIDUP (bukan salinan) ----
@@ -325,9 +378,14 @@ class LayananAkses : AccessibilityService() {
                         PowerManager.ACQUIRE_CAUSES_WAKEUP or
                         PowerManager.ON_AFTER_RELEASE, "musedroid:bangun")
                 wl.acquire(8000)
-                Thread.sleep(400)   // beri waktu peristiwa layar menyala
-                ok = pm.isInteractive
-                if (!ok) sebab = "layar masih mati setelah wakelock bangun"
+                // Poll isInteractive sampai 2 dtk (terbukti 9 Okt: cek
+                // tunggal 400 ms prematur — layar bangun belakangan).
+                var t = 0
+                while (t < 2000) {
+                    Thread.sleep(100); t += 100
+                    if (pm.isInteractive) { ok = true; break }
+                }
+                if (!ok) sebab = "layar masih mati setelah 2 dtk"
             } else sebab = "PowerManager tidak tersedia"
         } else if (kode == 3 || kode == 4) {
             return aksiGlobal(if (kode == 3) "HOME" else "BACK").put("kode", kode)
@@ -343,6 +401,222 @@ class LayananAkses : AccessibilityService() {
         return out
     }
 
+    // ---- mata (V4.3.1) ----
+    // AccessibilityService.takeScreenshot (API 30+) — tanpa izin
+    // MediaProjection per sesi; yang ditolak sistem (jendela aman
+    // FLAG_SECURE, layar mati) dilaporkan jujur lewat kode galat.
+
+    data class HasilBingkai(val json: JSONObject, val png: ByteArray?)
+
+    @Volatile private var galatTangkap: String = ""
+
+    // Satu percobaan tangkap mentah; null bila gagal (galatTangkap terisi).
+    private fun tangkapMentah(): ByteArray? {
+        if (Build.VERSION.SDK_INT < 30) {
+            galatTangkap = "takeScreenshot butuh Android 11+"
+            return null
+        }
+        val gerbang = CountDownLatch(1)
+        var png: ByteArray? = null
+        var galat = -1
+        PohonUI.tangkapTerakhirMs = SystemClock.uptimeMillis()
+        try {
+            takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor,
+                object : TakeScreenshotCallback {
+                    override fun onSuccess(hasil: ScreenshotResult) {
+                        try {
+                            val bmp = Bitmap.wrapHardwareBuffer(
+                                hasil.hardwareBuffer, hasil.colorSpace)
+                            if (bmp != null) {
+                                val salinan = bmp.copy(Bitmap.Config.ARGB_8888, false)
+                                bmp.recycle()
+                                val bos = ByteArrayOutputStream()
+                                salinan.compress(Bitmap.CompressFormat.PNG, 100, bos)
+                                salinan.recycle()
+                                png = bos.toByteArray()
+                            }
+                        } catch (e: Exception) { }
+                        try { hasil.hardwareBuffer.close() } catch (e: Exception) { }
+                        gerbang.countDown()
+                    }
+                    override fun onFailure(kodeGalat: Int) {
+                        galat = kodeGalat
+                        gerbang.countDown()
+                    }
+                })
+        } catch (e: Exception) {
+            galatTangkap = "takeScreenshot melempar: " + e.message
+            return null
+        }
+        gerbang.await(4, TimeUnit.SECONDS)
+        val hasilPng = png
+        if (hasilPng == null) {
+            galatTangkap = if (galat >= 0) "takeScreenshot gagal, kode " + galat
+                else "timeout tangkapan (4 dtk)"
+        }
+        return hasilPng
+    }
+
+    private fun simpanBingkai(png: ByteArray) {
+        PohonUI.bingkaiPng = png
+        PohonUI.bingkaiVersi = PohonUI.versi
+        PohonUI.bingkaiStempelMs = SystemClock.uptimeMillis()
+    }
+
+    // Tangkap otomatis terpicu ganti paket. Di V4.3 ia menembak sekali
+    // 400 ms sesudah ganti paket — layar kerap masih transisi dan
+    // tembakan itu gagal diam-diam (buffer tidak pernah berubah).
+    // V4.3.1: coba sampai 3x dengan jeda membesar (0/900/1800 ms);
+    // hasil tiap episode TERHITUNG dan galat terakhir tercatat, bisa
+    // dibaca dari header AMBIL ("oto_sukses"/"oto_gagal"/"oto_galat").
+    fun tangkapOtomatis() {
+        val jeda = longArrayOf(0, 900, 1800)
+        for (i in jeda.indices) {
+            if (jeda[i] > 0) Thread.sleep(jeda[i])
+            val png = try { tangkapMentah() } catch (e: Exception) { null }
+            if (png != null) {
+                simpanBingkai(png)
+                PohonUI.otoSukses++
+                return
+            }
+        }
+        PohonUI.otoGagal++
+        PohonUI.otoGalat = galatTangkap
+    }
+
+    fun bingkai(segar: Boolean): HasilBingkai {
+        val out = JSONObject()
+        val buf = PohonUI.bingkaiPng
+        val umurBuf = if (PohonUI.bingkaiStempelMs == 0L) -1
+            else SystemClock.uptimeMillis() - PohonUI.bingkaiStempelMs
+        if (!segar && buf != null) {
+            out.put("ok", true).put("sumber", "buffer")
+                .put("versi_bingkai", PohonUI.bingkaiVersi)
+                .put("umur_bingkai_ms", umurBuf).put("byte", buf.size)
+                .put("oto_sukses", PohonUI.otoSukses).put("oto_gagal", PohonUI.otoGagal)
+            if (PohonUI.otoGalat.isNotEmpty()) out.put("oto_galat", PohonUI.otoGalat)
+            return HasilBingkai(out, buf)
+        }
+        if (instans == null) return HasilBingkai(
+            out.put("ok", false).put("sebab", "layanan tidak aktif"), null)
+        val sejak = SystemClock.uptimeMillis() - PohonUI.tangkapTerakhirMs
+        if (buf != null && sejak < 1100) {
+            out.put("ok", true).put("sumber", "buffer-throttle")
+                .put("versi_bingkai", PohonUI.bingkaiVersi)
+                .put("umur_bingkai_ms", umurBuf).put("byte", buf.size)
+                .put("oto_sukses", PohonUI.otoSukses).put("oto_gagal", PohonUI.otoGagal)
+            if (PohonUI.otoGalat.isNotEmpty()) out.put("oto_galat", PohonUI.otoGalat)
+            return HasilBingkai(out, buf)
+        }
+        val png = tangkapMentah()
+        if (png == null) return HasilBingkai(
+            out.put("ok", false).put("sebab", galatTangkap), null)
+        simpanBingkai(png)
+        return HasilBingkai(out.put("ok", true).put("sumber", "segar")
+            .put("versi_bingkai", PohonUI.bingkaiVersi)
+            .put("umur_bingkai_ms", 0).put("byte", png.size), png)
+    }
+
+    // ---- mata baca (V4.4) ----
+    // OCR di perangkat atas bingkai segar (mekanisme tangkap sama
+    // persis seperti BINGKAI). Balasan satu string multi-baris:
+    // header JSON lalu satu baris per teks hasil saring:
+    // "teks<TAB>x1,y1,x2,y2<TAB>skor". Argumen opsional pada perintah:
+    // ambang skor (bawaan 0,5 — sama text_score RapidOCR prototipe)
+    // dan token STATUSBAR untuk menyertakan pita status bar.
+
+    fun bacaLayar(perintah: String): String {
+        val mulai = SystemClock.uptimeMillis()
+        fun gagal(sebab: String): String {
+            return JSONObject().put("ok", false).put("sebab", sebab)
+                .put("versi_bingkai", PohonUI.bingkaiVersi)
+                .put("latensi_ms", SystemClock.uptimeMillis() - mulai)
+                .put("jumlah_baris", 0).toString()
+        }
+        // Gerbang baterai (pengaman desain Mata): OCR ditahan di
+        // bawah 30% tanpa cas. Kegagalan membaca status baterai
+        // tidak menghalangi (gagal-aman ke lanjut).
+        try {
+            val bm = getSystemService(android.os.BatteryManager::class.java)
+            if (bm != null && Build.VERSION.SDK_INT >= 26) {
+                val level = bm.getIntProperty(
+                    android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY)
+                val status = bm.getIntProperty(
+                    android.os.BatteryManager.BATTERY_PROPERTY_STATUS)
+                val ngecas = status ==
+                    android.os.BatteryManager.BATTERY_STATUS_CHARGING ||
+                    status == android.os.BatteryManager.BATTERY_STATUS_FULL
+                if (level in 0..29 && !ngecas) {
+                    return gagal(
+                        "baterai $level% (<30%) tanpa cas — OCR ditahan")
+                }
+            }
+        } catch (e: Throwable) { /* lanjut */ }
+        var ambang = 0.5f
+        var sertakanStatusBar = false
+        val token = perintah.trim().split(Regex("\\s+"))
+        for (t in token.drop(1)) {
+            val f = t.toFloatOrNull()
+            if (f != null) ambang = f.coerceIn(0f, 1f)
+            else if (t.equals("STATUSBAR", ignoreCase = true)) {
+                sertakanStatusBar = true
+            }
+        }
+        val hasil = bingkai(true)
+        val pngMentah = hasil.png
+        if (!hasil.json.optBoolean("ok") || pngMentah == null) {
+            return gagal(hasil.json.optString("sebab", "tangkapan gagal"))
+        }
+        val bmp = try {
+            android.graphics.BitmapFactory.decodeByteArray(
+                pngMentah, 0, pngMentah.size)
+        } catch (e: Exception) { null }
+            ?: return gagal("bingkai tidak bisa di-decode")
+        val mentah = try {
+            MesinOcr.baca(applicationContext, bmp, ambang)
+        } catch (e: Exception) {
+            try { bmp.recycle() } catch (x: Exception) { }
+            return gagal("OCR galat: " + (e.message ?: e.javaClass.simpleName))
+        }
+        // Penyaring positif-palsu v1 (desain butir 5): (a) baris yang
+        // hanya berisi simbol dengan panjang <=2 karakter dibuang;
+        // (b) baris yang pusatnya berada di pita status bar dibuang
+        // kecuali STATUSBAR diminta eksplisit.
+        val strip = tinggiStatusBar(bmp.height)
+        val bersih = mentah.filter { b ->
+            val t = b.teks.trim()
+            val simbolSaja = t.length <= 2 && t.none { it.isLetterOrDigit() }
+            val diStatusBar = !sertakanStatusBar && (b.y1 + b.y2) / 2 < strip
+            !simbolSaja && !diStatusBar
+        }
+        try { bmp.recycle() } catch (e: Exception) { }
+        val sb = StringBuilder()
+        sb.append(JSONObject().put("ok", true)
+            .put("versi_bingkai", PohonUI.bingkaiVersi)
+            .put("latensi_ms", SystemClock.uptimeMillis() - mulai)
+            .put("jumlah_baris", bersih.size).toString())
+        for (b in bersih) {
+            val teksAman = b.teks.replace('\t', ' ').replace('\n', ' ')
+                .replace('\r', ' ')
+            sb.append('\n').append(teksAman).append('\t')
+                .append(b.x1).append(',').append(b.y1).append(',')
+                .append(b.x2).append(',').append(b.y2).append('\t')
+                .append(String.format(java.util.Locale.US, "%.3f", b.skor))
+        }
+        return sb.toString()
+    }
+
+    private fun tinggiStatusBar(tinggiBingkai: Int): Int {
+        return try {
+            val id = resources.getIdentifier(
+                "status_bar_height", "dimen", "android")
+            if (id > 0) resources.getDimensionPixelSize(id)
+            else (tinggiBingkai * 0.04).toInt()
+        } catch (e: Exception) {
+            (tinggiBingkai * 0.04).toInt()
+        }
+    }
+
     // ---- penyaji socket 19102 ----
 
     private fun penyaji() {
@@ -356,7 +630,30 @@ class LayananAkses : AccessibilityService() {
                                 InputStreamReader(it.getInputStream(), Charsets.UTF_8))
                             val keluar = PrintWriter(it.getOutputStream(), true)
                             val perintah = masuk.readLine() ?: return@thread
-                            keluar.println(jawab(perintah))
+                            val kataAwal = perintah.substringBefore(' ').trim().uppercase()
+                            if (kataAwal == "BINGKAI" || kataAwal == "AMBIL" ||
+                                kataAwal == "BACA") {
+                                val lay = instans
+                                if (lay == null) {
+                                    keluar.println(JSONObject().put("ok", false)
+                                        .put("sebab", "layanan tidak aktif").toString())
+                                } else if (kataAwal == "BACA") {
+                                    keluar.println(lay.bacaLayar(perintah))
+                                    keluar.flush()
+                                } else {
+                                    val hasil = lay.bingkai(kataAwal == "BINGKAI")
+                                    keluar.println(hasil.json.toString())
+                                    keluar.flush()
+                                    val png = hasil.png
+                                    if (hasil.json.optBoolean("ok") && png != null) {
+                                        val os = it.getOutputStream()
+                                        os.write(png)
+                                        os.flush()
+                                    }
+                                }
+                            } else {
+                                keluar.println(jawab(perintah))
+                            }
                         }
                     }
                 }
@@ -374,6 +671,33 @@ class LayananAkses : AccessibilityService() {
         return when (kata) {
             "PING" -> JSONObject().put("pong", true)
                 .put("versi", PohonUI.versi).put("umur_ms", umur).toString()
+            "STATUS" -> {
+                // V5: potret kesehatan satu jawaban untuk detektor
+                // penjaga — lihat catatan protokol di kepala berkas.
+                val out = JSONObject().put("ok", true)
+                    .put("versi", PohonUI.versi).put("umur_ms", umur)
+                    .put("stempel_ms", PohonUI.stempelMs)
+                    .put("sekarang_uptime_ms", SystemClock.uptimeMillis())
+                    .put("terikat", aktif)
+                    .put("paket", PohonUI.paketDepan)
+                    .put("jumlah_simpul", PohonUI.simpul.size)
+                    .put("oto_sukses", PohonUI.otoSukses)
+                    .put("oto_gagal", PohonUI.otoGagal)
+                    .put("bingkai_versi", PohonUI.bingkaiVersi)
+                    .put("umur_bingkai_ms",
+                        if (PohonUI.bingkaiStempelMs == 0L) -1
+                        else SystemClock.uptimeMillis() - PohonUI.bingkaiStempelMs)
+                try {
+                    val info = packageManager.getPackageInfo(packageName, 0)
+                    out.put("kode_versi",
+                        if (Build.VERSION.SDK_INT >= 28) info.longVersionCode
+                        else @Suppress("DEPRECATION") info.versionCode.toLong())
+                    out.put("nama_versi", info.versionName ?: "")
+                } catch (e: Exception) {
+                    out.put("kode_versi", -1).put("nama_versi", "")
+                }
+                out.toString()
+            }
             "PAKET?" -> JSONObject().put("paket", PohonUI.paketDepan)
                 .put("umur_ms", umur).toString()
             "TEKS?" -> JSONObject().put("ada", cari(arg) != null)

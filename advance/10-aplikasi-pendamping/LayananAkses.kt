@@ -6,6 +6,16 @@
 //
 // Protokol (satu baris UTF-8 per koneksi, balasan satu baris JSON):
 //   PING          -> {"pong":true,"versi":N,"umur_ms":N}
+//   STATUS        -> {"ok":true,"versi":N,"umur_ms":N,"stempel_ms":N,
+//                     "sekarang_uptime_ms":N,"terikat":bool,"paket":"...",
+//                     "jumlah_simpul":N,"oto_sukses":N,"oto_gagal":N,
+//                     "bingkai_versi":N,"umur_bingkai_ms":N,
+//                     "kode_versi":N,"nama_versi":"..."}
+//                     (V5 "Sembuh Sendiri": bahan baku detektor kesehatan —
+//                     versi salinan, waktu kejadian terakhir (uptime),
+//                     umur salinan, status ikatan layanan, dan penghitung
+//                     tangkap otomatis; satu jawaban ringkas agar penjaga
+//                     tidak perlu menebak dari banyak perintah)
 //   PAKET?        -> {"paket":"nama.paket","umur_ms":N}
 //   TEKS? <teks>  -> {"ada":bool,"umur_ms":N,"versi":N}
 //   CARI <teks>   -> {"ada":true,"x":N,"y":N,"bounds":"[x1,y1][x2,y2]",
@@ -661,6 +671,33 @@ class LayananAkses : AccessibilityService() {
         return when (kata) {
             "PING" -> JSONObject().put("pong", true)
                 .put("versi", PohonUI.versi).put("umur_ms", umur).toString()
+            "STATUS" -> {
+                // V5: potret kesehatan satu jawaban untuk detektor
+                // penjaga — lihat catatan protokol di kepala berkas.
+                val out = JSONObject().put("ok", true)
+                    .put("versi", PohonUI.versi).put("umur_ms", umur)
+                    .put("stempel_ms", PohonUI.stempelMs)
+                    .put("sekarang_uptime_ms", SystemClock.uptimeMillis())
+                    .put("terikat", aktif)
+                    .put("paket", PohonUI.paketDepan)
+                    .put("jumlah_simpul", PohonUI.simpul.size)
+                    .put("oto_sukses", PohonUI.otoSukses)
+                    .put("oto_gagal", PohonUI.otoGagal)
+                    .put("bingkai_versi", PohonUI.bingkaiVersi)
+                    .put("umur_bingkai_ms",
+                        if (PohonUI.bingkaiStempelMs == 0L) -1
+                        else SystemClock.uptimeMillis() - PohonUI.bingkaiStempelMs)
+                try {
+                    val info = packageManager.getPackageInfo(packageName, 0)
+                    out.put("kode_versi",
+                        if (Build.VERSION.SDK_INT >= 28) info.longVersionCode
+                        else @Suppress("DEPRECATION") info.versionCode.toLong())
+                    out.put("nama_versi", info.versionName ?: "")
+                } catch (e: Exception) {
+                    out.put("kode_versi", -1).put("nama_versi", "")
+                }
+                out.toString()
+            }
             "PAKET?" -> JSONObject().put("paket", PohonUI.paketDepan)
                 .put("umur_ms", umur).toString()
             "TEKS?" -> JSONObject().put("ada", cari(arg) != null)

@@ -59,7 +59,7 @@ echo "== aapt2 compile res =="
 echo "== aapt2 link =="
 "$BT/aapt2" link -o out/app-unsigned.apk -I "$AJAR" \
   --manifest AndroidManifest.xml --min-sdk-version 24 --target-sdk-version 34 \
-  --version-code 47 --version-name 4.4.1 \
+  --version-code 48 --version-name 5.0-candidate \
   out/res.zip
 
 echo "== masukkan dex + lib native + aset + zipalign + tanda tangan =="

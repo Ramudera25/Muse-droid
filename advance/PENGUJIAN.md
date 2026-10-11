@@ -875,3 +875,28 @@ Atas perintah pemilik, prosedur LIHAT dijalankan ke Facebook:
 - Definisi lulus DESAIN-PENGAWAS-MISI: TERPENUHI seluruhnya
   (misi standar ber-VERIFIKASI + bukti, uji negatif, kartu dipakai
   runner saat BUKA, regresi v1 bersih via harness).
+
+## V5 Sembuh Sendiri — pembangunan 11 Okt 2026 (bayu)
+
+- Aplikasi: perintah soket baru STATUS di LayananAkses (versi
+  salinan, stempel kejadian terakhir, umur, terikat, penghitung
+  tangkap otomatis, versi paket). versionCode 48, versionName
+  "5.0-candidate", signer kanonis proyek. APK sha256
+  86853fff4679a96cd69c3ff10b0c58e8040d4b7aeb... (73.503.838 B).
+- Penjaga v2 (advance/13/penjaga-v2.py): detektor 3-lapis +
+  tangga 1–4 sesuai desain §3.1–3.2; mode AMATI bawaan, saklar
+  berkas conf ke OTOMATIS. Uji luring uji-penjaga-v2-luring.py:
+  12/12 asersi lulus (vonis SEHAT/diam-wajar/BEKU/MATI, AMATI
+  tanpa tindakan, tangga tercatat, eskalasi tertulis, pulih
+  tangga 1 pada server tiruan).
+- Runner: gerbang prasyarat §3.3 (versi pohon bergerak dua PING
+  berjarak, baterai >= ambang/SYARAT atau mengisi, penanda sesi
+  asing segar ditolak, keadaan target ditulis) + format misi v2
+  subset §3.4 (SYARAT baterai>=/target-dingin; LABEL + akhiran
+  `| henti|lanjut|ke <label>` per langkah). Parser v1 kompatibel
+  penuh. Harness uji-pengawas-luring.py diperluas: 44/44 asersi
+  lulus (21 warisan Pengawas Misi + 23 baru V5), termasuk
+  penolakan gerbang (pohon diam/baterai rendah/sesi asing) dan
+  kebijakan lanjut/ke-label. Runner md5 789a6e8e....
+- Uji perangkat + uji penerimaan tiga cara membunuh: lihat
+  lanjutan bagian ini sesudah sesi perangkat selesai.
